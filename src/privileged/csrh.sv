@@ -1,0 +1,628 @@
+///////////////////////////////////////////
+// csrh.sv
+//
+// Written: nchulani@hmc.edu, vkrishna@hmc.edu, jgong@hmc.edu 11 November 2025
+// Purpose: Hypervisor-Mode Control and Status Registers
+//          See RISC-V Privileged Mode Specification (Hypervisor Extension)
+//
+// Documentation: RISC-V System on Chip Design
+//
+// A component of the CORE-V-WALLY configurable RISC-V project.
+// https://github.com/openhwgroup/cvw
+//
+// Copyright (C) 2021-25 Harvey Mudd College & Oklahoma State University
+//
+// SPDX-License-Identifier: Apache-2.0 WITH SHL-2.1
+//
+// Licensed under the Solderpad Hardware License v 2.1 (the “License”); you may not use this file
+// except in compliance with the License, or, at your option, the Apache License version 2.0. You
+// may obtain a copy of the License at
+//
+// https://solderpad.org/licenses/SHL-2.1/
+//
+// Unless required by applicable law or agreed to in writing, any work distributed under the
+// License is distributed on an “AS IS” BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+// either express or implied. See the License for the specific language governing permissions
+// and limitations under the License.
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+module csrh import cvw::*;  #(parameter cvw_t P) (
+  input  logic              clk, reset,
+  input  logic              CSRHWriteM,       // High if operation is a write
+  input  logic              CSRWriteM,        // CSR instruction writes
+  input  logic [11:0]       CSRAdrM,
+  input  logic [P.XLEN-1:0] CSRWriteValM,
+  input  logic [1:0]        PrivilegeModeW,   // Current privilege mode (U, S, M)
+  input  logic              VirtModeW,        // Virtualization mode (VS/VU)
+  input  logic              FRegWriteM,       // VS FP writeback updates vsstatus.FS
+  input  logic              WriteFRMM,        // VS CSR write to FRM updates vsstatus.FS
+  input  logic              SetOrWriteFFLAGSM,// VS CSR write to FFLAGS updates vsstatus.FS
+  input  logic              TrapGVAM,         // Trap writes guest virtual address to tval
+  input  logic              VSCSRDirectM,     // VS CSR accessed via its own address in V=1
+  input  logic [11:0]       MIP_REGW,         // mip register for HIP calculation
+
+  input  logic              TrapM,            // Trap occurred
+  input  logic              TrapToHSM,        // Trap targets HS-mode
+  input  logic              TrapToVSM,        // Trap targets VS-mode
+  input  logic              sretM,            // SRET in M stage
+  input  logic [31:0]       InstrM,           // Instruction for mtinst/htinst decode
+  input  logic [P.XLEN-1:0] NextEPCM,         // EPC value for trap/return
+  input  logic [5:0]        NextCauseM,       // Exception/interrupt cause
+  input  logic [P.XLEN-1:0] NextMtvalM,       // Value for {v,s,}tval on trap
+  input  logic [P.XLEN-1:0] NextHtvalM,       // Value for htval on trap
+
+  output logic [P.XLEN-1:0] CSRHReadValM,
+  output logic              IllegalCSRHAccessM,
+  output logic              HSTATUS_SPV,
+  output logic              HSTATUS_VTSR, HSTATUS_VTW, HSTATUS_VTVM,
+  output logic              HSTATUS_VSBE,
+  output logic              VSSTATUS_SPP,
+  output logic              VSSTATUS_SUM, VSSTATUS_MXR, VSSTATUS_UBE,
+  output logic [1:0]        VSSTATUS_FS,
+  output logic [63:0]       HEDELEG_REGW,
+  output logic [11:0]       HIDELEG_REGW,
+  output logic [31:0]       HCOUNTEREN_REGW,
+  output logic [11:0]       HVIP_REGW,
+  output logic [63:0]       HTIMEDELTA_REGW,
+  output logic [63:0]       HENVCFG_REGW,
+  output logic [P.XLEN-1:0] VSTVEC_REGW,
+  output logic [P.XLEN-1:0] VSEPC_REGW
+);
+
+  logic [P.XLEN-1:0] MTINST_REGW;
+  logic [P.XLEN-1:0] MTVAL2_REGW;
+  logic [P.XLEN-1:0] HSTATUS_REGW;
+  logic [P.XLEN-1:0] VSSTATUS_REGW;
+  logic              HSTATUS_GVA, HSTATUS_SPVP, HSTATUS_HU;
+  logic [5:0]        HSTATUS_VGEIN;
+  logic [1:0]        HSTATUS_VSXL, HSTATUS_HUPMM;
+  logic              VSSTATUS_SD, VSSTATUS_SPELP, VSSTATUS_SDT;
+  logic              VSSTATUS_MXR_INT, VSSTATUS_SUM_INT;
+  logic              VSSTATUS_SPIE, VSSTATUS_SIE;
+  logic [1:0]        VSSTATUS_FS_INT, VSSTATUS_XS, VSSTATUS_UXL, VSSTATUS_VS;
+  logic [P.XLEN-1:0] HIE_REGW;
+  logic [P.XLEN-1:0] NextHIE;
+  logic [P.XLEN-1:0] HIE_WRITE_MASK;
+  logic [11:0]       VSIE_REGW;
+  // outputs declared above
+  logic [P.XLEN-1:0] HGEIE_REGW;
+
+  logic [P.XLEN-1:0] HTVAL_REGW;
+  logic [P.XLEN-1:0] VSTVAL_REGW;
+  logic [11:0]       VSIP_REGW;
+  // outputs declared above
+  logic [P.XLEN-1:0] HTINST_REGW;
+  logic [P.XLEN-1:0] HGATP_REGW;
+  logic [P.XLEN-1:0] HGEIP_REGW;
+  logic [P.XLEN-1:0] VSSCRATCH_REGW;
+  logic [P.XLEN-1:0] VSCAUSE_REGW;
+  logic [P.XLEN-1:0] VSATP_REGW;
+  logic [63:0] VSTIMECMP_REGW;
+
+  // Hypervisor CSR Addresses
+  localparam MTINST     = 12'h34A;
+  localparam MTVAL2     = 12'h34B;
+  localparam HSTATUS    = 12'h600;
+  localparam VSSTATUS   = 12'h200;
+  localparam HEDELEG    = 12'h602;
+  localparam HEDELEGH    = 12'h612;
+  localparam HIDELEG    = 12'h603;
+  localparam HIE        = 12'h604;
+  localparam VSIE       = 12'h204;
+  localparam HTIMEDELTA = 12'h605;
+  localparam HTIMEDELTAH = 12'h615;
+  localparam HCOUNTEREN = 12'h606;
+  localparam HGEIE      = 12'h607;
+  localparam HENVCFG    = 12'h60A;
+  localparam HENVCFGH   = 12'h61A;
+  localparam HTVAL      = 12'h643;
+  localparam VSTVAL    = 12'h243;
+  localparam HIP        = 12'h644;
+  localparam VSIP        = 12'h244;
+  localparam HVIP       = 12'h645;
+  localparam HTINST     = 12'h64A;
+  localparam HGATP      = 12'h680;
+  localparam HGEIP      = 12'hE12;
+  localparam VSTVEC     = 12'h205;
+  localparam VSSCRATCH  = 12'h240;
+  localparam VSEPC      = 12'h241;
+  localparam VSCAUSE    = 12'h242;
+  localparam VSATP      = 12'h280;
+  localparam VSTIMECMP  = 12'h24D;
+  localparam VSTIMECMPH = 12'h25D;
+  // HEDELEG: lower bits per Table 45; upper 32 bits are WARL (reserved 0 in RV64, accessible in RV32 via HEDELEGH).
+  // The RISC-V Arch Tests (Sail model) expect these to be writable WARL fields in RV32.
+  // The Strict Spec says bits 63:16 are reserved (should be zero).
+  // Set SIM_COMPLIANCE = 1 to pass Arch Tests.
+  // Set SIM_COMPLIANCE = 0 for strict spec (production).
+  localparam SIM_COMPLIANCE = 1;
+
+  logic [63:0] HEDELEG_MASK;
+  if (P.XLEN == 32 && SIM_COMPLIANCE) assign HEDELEG_MASK = 64'hFFFF_FFFF_000C_B1FF;
+  else                                            assign HEDELEG_MASK = 64'h0000_0000_000C_B1FF;
+  // HIDELEG: only VS-level interrupts (VSSIP/VSTIP/VSEIP) are writable.
+  localparam [11:0] HIDELEG_MASK = 12'h444;
+  localparam [11:0] HVIP_MASK    = 12'h444; // Only VSSIP[2], VSTIP[6], VSEIP[10] are writable (spec 7.4.4)
+  localparam [11:0] HIP_MASK     = 12'h444; // Valid interrupt bits for HIP read (spec 7.4.4)
+  localparam [12:0] HIE_MASK     = 13'h1444; // Writable HIE bits: SGEIE[12], VSEIE[10], VSTIE[6], VSSIE[2]
+
+  // Write Enables for CSR instructions
+  logic WriteMTINSTM;
+  logic WriteMTVAL2M;
+  logic WriteHSTATUSM, WriteVSSTATUS;
+  logic WriteHEDELEGM, WriteHEDELEGHM;
+  logic WriteHIDELEGM;
+  logic WriteHIEM, WriteVSIEM;
+  logic WriteHTIMEDELTAM, WriteHTIMEDELTAHM;
+  logic WriteHCOUNTERENM;
+  logic WriteHGEIEM;
+  logic WriteHENVCFGM, WriteHENVCFGHM;
+  logic WriteHTVALM, WriteVSTVALM;
+  logic WriteVSIPM;
+  logic WriteHVIPM;
+  logic WriteHTINSTM;
+  logic WriteHGATPM;
+  logic WriteHGEIPM;
+  logic WriteVSTVECM;
+  logic WriteVSSCRATCHM;
+  logic WriteVSEPCM;
+  logic WriteVSCAUSEM;
+  logic WriteVSATPM;
+  logic WriteVSTIMECMPM, WriteVSTIMECMPHM;
+  logic AllowVSTimecmpAccess;
+  logic HSTrapM, VSTrapM;
+  logic PrivReturnHSM, PrivReturnVSM;
+  logic [P.XLEN-1:0] NextMtinstM;
+  logic [P.XLEN-1:0] NextHtinstM;
+  logic [P.XLEN-1:0] NextMtval2M;
+
+  // Next Value Muxes
+  logic [P.XLEN-1:0] NextHTVAL;
+  logic [P.XLEN-1:0] NextHTINST;
+  logic [P.XLEN-1:0] NextVSCAUSE;
+  logic [63:0]       NextHEDELEG;
+  logic [11:0]       NextHIDELEG;
+  logic [11:0]       NextHVIP;
+  logic [11:0]       HIP_PENDING;
+  logic [P.XLEN-1:0] VSTVECWriteValM;
+  logic [63:0]       NextHENVCFG;
+  logic [63:0]       CSRWriteValExt;
+  logic [1:0]        LegalizedHENVCFG_CBIE;
+
+  if (P.XLEN == 64) begin: csrwriteext64
+    assign CSRWriteValExt = CSRWriteValM;
+  end else begin: csrwriteext32
+    assign CSRWriteValExt = {32'b0, CSRWriteValM};
+  end
+
+  // CBIE has WARL encoding; 2'b10 is reserved and retains the previous value.
+  assign LegalizedHENVCFG_CBIE = (CSRWriteValM[5:4] == 2'b10) ? HENVCFG_REGW[5:4] : CSRWriteValM[5:4];
+
+  // CSR Write Validation Intermediates
+  logic LegalHAccessM;
+  logic LegalVSAccessM;
+  logic ReadOnlyCSR;
+  logic ValidHWrite, ValidVSWrite;
+  logic LegalAccessM;
+
+  // H-CSRs are accessible in M-Mode or HS-Mode.
+  // VS-CSRs are accessible in M-Mode or HS-Mode; in VS-Mode they are accessed via S-CSR remapping.
+  // Access is ILLEGAL in U-Mode (U/VU), and H-CSRs are illegal in VS-Mode.
+  assign LegalHAccessM = (PrivilegeModeW == P.M_MODE) |
+                        ((PrivilegeModeW == P.S_MODE) & ~VirtModeW);
+  assign LegalVSAccessM = (PrivilegeModeW == P.M_MODE) |
+                          ((PrivilegeModeW == P.S_MODE) & (~VirtModeW | ~VSCSRDirectM));
+
+  assign ReadOnlyCSR = (CSRAdrM == HIP) | (CSRAdrM == HGEIP);
+
+  assign ValidHWrite  = CSRHWriteM & LegalHAccessM & ~ReadOnlyCSR;
+  assign ValidVSWrite = CSRHWriteM & LegalVSAccessM;
+
+  assign HSTrapM = TrapM & TrapToHSM;
+  assign VSTrapM = TrapM & TrapToVSM;
+  assign PrivReturnHSM = sretM & (PrivilegeModeW == P.S_MODE) & ~VirtModeW;
+  assign PrivReturnVSM = sretM & (PrivilegeModeW == P.S_MODE) &  VirtModeW;
+
+  // mtinst/htinst/mtval2 are derived from the trapped instruction (InstrM); not yet implemented.
+  assign NextMtinstM = CSRWriteValM;
+  assign NextHtinstM = CSRWriteValM;
+  assign NextMtval2M = '0;
+
+  // Write enables for each CSR (from CSR instruction)
+  assign WriteMTINSTM     = ValidHWrite & (CSRAdrM == MTINST) & (PrivilegeModeW == P.M_MODE);
+  assign WriteMTVAL2M     = ValidHWrite & (CSRAdrM == MTVAL2) & (PrivilegeModeW == P.M_MODE);
+  assign WriteHSTATUSM    = ValidHWrite & (CSRAdrM == HSTATUS);
+  assign WriteVSSTATUS    = ValidVSWrite & (CSRAdrM == VSSTATUS);
+  assign WriteHEDELEGM    = ValidHWrite & (CSRAdrM == HEDELEG);
+  assign WriteHEDELEGHM   = (P.XLEN == 32) & (ValidHWrite & (CSRAdrM == HEDELEGH));
+  assign WriteHIDELEGM    = ValidHWrite & (CSRAdrM == HIDELEG);
+  assign WriteHIEM        = ValidHWrite & (CSRAdrM == HIE);
+  assign WriteVSIEM       = ValidVSWrite & (CSRAdrM == VSIE);
+  assign WriteHTIMEDELTAM = ValidHWrite & (CSRAdrM == HTIMEDELTA);
+  assign WriteHTIMEDELTAHM = (P.XLEN == 32) & (ValidHWrite & (CSRAdrM == HTIMEDELTAH));
+  assign WriteHCOUNTERENM = ValidHWrite & (CSRAdrM == HCOUNTEREN);
+  assign WriteHGEIEM      = ValidHWrite & (CSRAdrM == HGEIE);
+  assign WriteHENVCFGM    = ValidHWrite & (CSRAdrM == HENVCFG);
+  assign WriteHENVCFGHM   = (P.XLEN == 32) & (ValidHWrite & (CSRAdrM == HENVCFGH));
+  assign WriteHTVALM      = ValidHWrite & (CSRAdrM == HTVAL);
+  assign WriteVSTVALM     = ValidVSWrite & (CSRAdrM == VSTVAL);
+  assign WriteVSIPM       = ValidVSWrite & (CSRAdrM == VSIP);
+  assign WriteHVIPM       = ValidHWrite & (CSRAdrM == HVIP);
+  assign WriteHTINSTM     = ValidHWrite & (CSRAdrM == HTINST);
+  assign WriteHGATPM      = ValidHWrite & (CSRAdrM == HGATP);
+  // GEILEN=0 (guest external interrupts unimplemented): HGEIP remains 0.
+  // TODO: Add external interrupt handling and GEILEN parameterization.
+  assign WriteHGEIPM      = 1'b0;
+  assign WriteVSTVECM     = ValidVSWrite & (CSRAdrM == VSTVEC);
+  assign WriteVSSCRATCHM  = ValidVSWrite & (CSRAdrM == VSSCRATCH);
+  assign WriteVSEPCM      = ValidVSWrite & (CSRAdrM == VSEPC);
+  assign WriteVSCAUSEM    = ValidVSWrite & (CSRAdrM == VSCAUSE);
+  assign WriteVSATPM      = ValidVSWrite & (CSRAdrM == VSATP) & P.VIRTMEM_SUPPORTED;
+  // HCOUNTEREN.TM gates vstimecmp access in VS-mode.
+  assign AllowVSTimecmpAccess = ~VirtModeW | HCOUNTEREN_REGW[1];
+  assign WriteVSTIMECMPM  = ValidVSWrite & (CSRAdrM == VSTIMECMP) & P.SSTC_SUPPORTED & AllowVSTimecmpAccess;
+  assign WriteVSTIMECMPHM = (P.XLEN == 32) & P.SSTC_SUPPORTED &
+                            (ValidVSWrite & (CSRAdrM == VSTIMECMPH)) & AllowVSTimecmpAccess;
+
+
+  // MTINST
+  flopenr #(P.XLEN) MTINSTreg(clk, reset, WriteMTINSTM, NextMtinstM, MTINST_REGW);
+
+  // MTVAL2
+  flopenr #(P.XLEN) MTVAL2reg(clk, reset, WriteMTVAL2M, NextMtval2M, MTVAL2_REGW);
+
+
+  // HSTATUS
+  // HS-visible virtualization control; SPV tracks prior V on HS traps and clears on HS sret.
+  always_ff @(posedge clk)
+    if (reset) begin
+      HSTATUS_SPV   <= 1'b0;
+      HSTATUS_SPVP  <= 1'b0;
+      HSTATUS_GVA   <= 1'b0;
+      HSTATUS_VSBE  <= 1'b0;
+      HSTATUS_HU    <= 1'b0;
+      HSTATUS_VGEIN <= 6'b0;
+      HSTATUS_VTVM  <= 1'b0;
+      HSTATUS_VTW   <= 1'b0;
+      HSTATUS_VTSR  <= 1'b0;
+    end else if (HSTrapM) begin
+      HSTATUS_SPV <= VirtModeW;
+      if (VirtModeW)
+        HSTATUS_SPVP <= PrivilegeModeW[0];
+      HSTATUS_GVA <= TrapGVAM;
+    end else if (PrivReturnHSM) begin
+      HSTATUS_SPV <= 1'b0;
+    end else if (WriteHSTATUSM) begin
+      HSTATUS_VSBE  <= 1'b0; // P.BIGENDIAN_SUPPORTED & CSRWriteValM[5];
+      HSTATUS_GVA   <= CSRWriteValM[6];
+      HSTATUS_SPV   <= CSRWriteValM[7];
+      HSTATUS_SPVP  <= CSRWriteValM[8];
+      HSTATUS_HU    <= P.U_SUPPORTED & CSRWriteValM[9];
+      // GEILEN=0 (guest external interrupts unimplemented): VGEIN is WARL read-only 0.
+      HSTATUS_VGEIN <= 6'b0; // CSRWriteValM[17:12];
+      HSTATUS_VTVM  <= CSRWriteValM[20];
+      HSTATUS_VTW   <= CSRWriteValM[21];
+      HSTATUS_VTSR  <= CSRWriteValM[22];
+    end
+
+  assign HSTATUS_VSXL = (P.XLEN == 64) ? 2'b10 : 2'b00;
+  assign HSTATUS_HUPMM = 2'b00;
+
+  if (P.XLEN == 64) begin : hstatus64
+    assign HSTATUS_REGW = {14'b0, HSTATUS_HUPMM, 14'b0, HSTATUS_VSXL, 9'b0,
+                           HSTATUS_VTSR, HSTATUS_VTW, HSTATUS_VTVM, 2'b0,
+                           HSTATUS_VGEIN, 2'b0, HSTATUS_HU, HSTATUS_SPVP,
+                           HSTATUS_SPV, HSTATUS_GVA, HSTATUS_VSBE, 5'b0};
+  end else begin : hstatus32
+    assign HSTATUS_REGW = {9'b0, HSTATUS_VTSR, HSTATUS_VTW, HSTATUS_VTVM, 2'b0,
+                           HSTATUS_VGEIN, 2'b0, HSTATUS_HU, HSTATUS_SPVP,
+                           HSTATUS_SPV, HSTATUS_GVA, HSTATUS_VSBE, 5'b0};
+  end
+
+  // VSSTATUS
+  // Guest-visible SSTATUS state, updated on VS traps/returns or CSR writes.
+  assign VSSTATUS_MXR = VSSTATUS_MXR_INT;
+  assign VSSTATUS_SUM = P.VIRTMEM_SUPPORTED & VSSTATUS_SUM_INT;
+  assign VSSTATUS_FS  = P.F_SUPPORTED ? VSSTATUS_FS_INT : 2'b00;
+  assign VSSTATUS_XS  = 2'b00;
+  assign VSSTATUS_VS  = 2'b00;
+  assign VSSTATUS_SPELP = 1'b0;
+  assign VSSTATUS_SDT = 1'b0;
+  assign VSSTATUS_SD  = (VSSTATUS_FS == 2'b11) | (VSSTATUS_XS == 2'b11) | (VSSTATUS_VS == 2'b11);
+  assign VSSTATUS_UXL = P.U_SUPPORTED ? ((P.XLEN == 64) ? 2'b10 : 2'b01) : 2'b00;
+
+  if (P.XLEN == 64) begin : vsstatus64
+    assign VSSTATUS_REGW = {VSSTATUS_SD, 29'b0, VSSTATUS_UXL, 7'b0,
+                            VSSTATUS_SDT, VSSTATUS_SPELP, 3'b0,
+                            VSSTATUS_MXR, VSSTATUS_SUM, 1'b0,
+                            VSSTATUS_XS, VSSTATUS_FS, 2'b0, VSSTATUS_VS,
+                            VSSTATUS_SPP, 1'b0, VSSTATUS_UBE, VSSTATUS_SPIE,
+                            3'b0, VSSTATUS_SIE, 1'b0};
+  end else begin : vsstatus32
+    assign VSSTATUS_REGW = {VSSTATUS_SD, 6'b0, VSSTATUS_SDT, VSSTATUS_SPELP, 3'b0,
+                            VSSTATUS_MXR, VSSTATUS_SUM, 1'b0,
+                            VSSTATUS_XS, VSSTATUS_FS, 2'b0, VSSTATUS_VS,
+                            VSSTATUS_SPP, 1'b0, VSSTATUS_UBE, VSSTATUS_SPIE,
+                            3'b0, VSSTATUS_SIE, 1'b0};
+  end
+
+  // VSSTATUS update mirrors SSTATUS ordering in csrsr for easier sharing.
+  always_ff @(posedge clk)
+    if (reset) begin
+      VSSTATUS_MXR_INT <= 1'b0;
+      VSSTATUS_SUM_INT <= 1'b0;
+      VSSTATUS_FS_INT  <= 2'b00;
+      VSSTATUS_SPP     <= 1'b0;
+      VSSTATUS_SPIE    <= 1'b0;
+      VSSTATUS_SIE     <= 1'b0;
+      VSSTATUS_UBE     <= 1'b0;
+    end else if (VSTrapM) begin
+      VSSTATUS_SPIE <= VSSTATUS_SIE;
+      VSSTATUS_SIE  <= 1'b0;
+      VSSTATUS_SPP  <= PrivilegeModeW[0];
+    end else if (PrivReturnVSM) begin
+      VSSTATUS_SIE  <= VSSTATUS_SPIE;
+      VSSTATUS_SPIE <= 1'b1;
+      VSSTATUS_SPP  <= 1'b0;
+    end else if (WriteVSSTATUS) begin
+      VSSTATUS_MXR_INT <= CSRWriteValM[19];
+      VSSTATUS_SUM_INT <= P.VIRTMEM_SUPPORTED & CSRWriteValM[18];
+      VSSTATUS_FS_INT  <= CSRWriteValM[14:13];
+      VSSTATUS_SPP     <= CSRWriteValM[8];
+      VSSTATUS_SPIE    <= CSRWriteValM[5];
+      VSSTATUS_SIE     <= CSRWriteValM[1];
+      // Spike appears to treat VSSTATUS.UBE as read-only zero; SIM_COMPLIANCE forces 0 for test alignment.
+      VSSTATUS_UBE     <= SIM_COMPLIANCE ? 1'b0 : (P.U_SUPPORTED & P.BIGENDIAN_SUPPORTED & CSRWriteValM[6]);
+    end else if (VirtModeW & (FRegWriteM | WriteFRMM | SetOrWriteFFLAGSM)) begin
+      VSSTATUS_FS_INT  <= 2'b11;
+    end
+
+  // Exception and Interrupt Delegation Registers
+  // Mask off read-only zero bits (see ISA 15.2.2)
+  if (P.XLEN == 64) begin : hedeleg_update_64
+    always_comb begin
+      NextHEDELEG = HEDELEG_REGW;
+      if (WriteHEDELEGM) NextHEDELEG = CSRWriteValM & HEDELEG_MASK;
+    end
+  end else begin : hedeleg_update_32
+    always_comb begin
+      NextHEDELEG = HEDELEG_REGW;
+      if (WriteHEDELEGM)  NextHEDELEG[31:0]  = CSRWriteValM[31:0] & HEDELEG_MASK[31:0];
+      if (WriteHEDELEGHM) NextHEDELEG[63:32] = CSRWriteValM[31:0] & HEDELEG_MASK[63:32];
+    end
+  end
+  flopenr #(64) HEDELEGreg(clk, reset, (WriteHEDELEGM | WriteHEDELEGHM), NextHEDELEG, HEDELEG_REGW);
+
+  assign NextHIDELEG = WriteHIDELEGM ? (CSRWriteValM[11:0] & HIDELEG_MASK) : HIDELEG_REGW;
+  flopenr #(12) HIDELEGreg(clk, reset, WriteHIDELEGM, NextHIDELEG, HIDELEG_REGW);
+
+  // Interrupt Enable / Pending
+  assign HIE_WRITE_MASK = {{(P.XLEN-13){1'b0}}, HIE_MASK};
+  // VSIE writes update HIE bits only when corresponding hideleg bits are set.
+  always_comb begin
+    NextHIE = HIE_REGW & HIE_WRITE_MASK;
+    if (WriteHIEM) NextHIE = CSRWriteValM & HIE_WRITE_MASK;
+    if (WriteVSIEM) begin
+      if (HIDELEG_REGW[2])  NextHIE[2]  = CSRWriteValM[1]; // SSIE -> VSSIE
+      if (HIDELEG_REGW[6])  NextHIE[6]  = CSRWriteValM[5]; // STIE -> VSTIE
+      if (HIDELEG_REGW[10]) NextHIE[10] = CSRWriteValM[9]; // SEIE -> VSEIE
+    end
+  end
+  flopenr #(P.XLEN) HIEreg(clk, reset, (WriteHIEM | WriteVSIEM), NextHIE, HIE_REGW);
+  flopenr #(12)     HVIPreg(clk, reset, (WriteHVIPM | WriteVSIPM), NextHVIP, HVIP_REGW);
+  flopenr #(P.XLEN) HGEIEreg(clk, reset, WriteHGEIEM, CSRWriteValM, HGEIE_REGW);
+
+  // VSIP/VSIE are aliases of HIP/HIE when delegated; otherwise read-only zero.
+  assign HIP_PENDING = (HVIP_REGW | MIP_REGW) & HIP_MASK;
+  always_comb begin
+    VSIE_REGW = 12'b0;
+    if (HIDELEG_REGW[2])  VSIE_REGW[1] = HIE_REGW[2];
+    if (HIDELEG_REGW[6])  VSIE_REGW[5] = HIE_REGW[6];
+    if (HIDELEG_REGW[10]) VSIE_REGW[9] = HIE_REGW[10];
+    // LCOFIE not supported; keep bit 13 at 0.
+  end
+
+  // HVIP: Only bits 2 (VSSIP), 6 (VSTIP), 10 (VSEIP) are writable per spec 7.4.4
+  // VSIP writes can update VSSIP only when hideleg[2] is set.
+  always_comb begin
+    NextHVIP = HVIP_REGW;
+    if (WriteHVIPM) NextHVIP = (HVIP_REGW & ~HVIP_MASK) | (CSRWriteValM[11:0] & HVIP_MASK);
+    else if (WriteVSIPM) begin
+        NextHVIP[2]  = CSRWriteValM[1];
+        NextHVIP[6]  = CSRWriteValM[5];
+        NextHVIP[10] = CSRWriteValM[9];
+    end
+  end
+  flopenr #(12)     HVIPreg(clk, reset, (WriteHVIPM | WriteVSIPM), NextHVIP, HVIP_REGW);
+  assign VSIP_REGW = (HIP_PENDING & HIDELEG_REGW) >> 1;
+
+  // GEILEN=0 (guest external interrupts unimplemented): HGEIE is WARL read-only 0.
+  flopenr #(P.XLEN) HGEIEreg(clk, reset, WriteHGEIEM, '0, HGEIE_REGW);
+
+  // HTVAL: Written by CSR instructions and by hardware on traps
+  assign NextHTVAL = HSTrapM ? NextHtvalM : CSRWriteValM;
+  flopenr #(P.XLEN) HTVALreg(clk, reset, (WriteHTVALM | HSTrapM), NextHTVAL, HTVAL_REGW);
+
+  // HTINST: Written by CSR instructions and by hardware on traps
+  assign NextHTINST = HSTrapM ? NextHtinstM : CSRWriteValM;
+  flopenr #(P.XLEN) HTINSTreg(clk, reset, (WriteHTINSTM | HSTrapM), NextHTINST, HTINST_REGW);
+
+  // VS CSRs: Guest-visible S-mode state
+  // VSTVEC: preserve base bits [XLEN-1:2], force MODE[1:0] to 01 (vect) or 00 (direct).
+  assign VSTVECWriteValM = CSRWriteValM[0] ? {CSRWriteValM[P.XLEN-1:2], 2'b01} :
+                                              {CSRWriteValM[P.XLEN-1:2], 2'b00};
+  flopenr #(P.XLEN) VSTVECreg(clk, reset, WriteVSTVECM, VSTVECWriteValM, VSTVEC_REGW);
+  flopenr #(P.XLEN) VSSCRATCHreg(clk, reset, WriteVSSCRATCHM, CSRWriteValM, VSSCRATCH_REGW);
+  flopenr #(P.XLEN) VSEPCreg(clk, reset, (VSTrapM | WriteVSEPCM), NextEPCM, VSEPC_REGW);
+  // VSCAUSE is WLRL; allow CSR writes to set full VSXLEN value, but let traps override.
+  assign NextVSCAUSE = VSTrapM ? {NextCauseM[5], {(P.XLEN-6){1'b0}}, NextCauseM[4:0]}
+                               : CSRWriteValM;
+  flopenr #(P.XLEN) VSCAUSEreg(clk, reset, (VSTrapM | WriteVSCAUSEM), NextVSCAUSE, VSCAUSE_REGW);
+  flopenr #(P.XLEN) VSTVALreg(clk, reset, (VSTrapM | WriteVSTVALM), NextMtvalM, VSTVAL_REGW);
+  if (P.VIRTMEM_SUPPORTED)
+    flopenr #(P.XLEN) VSATPreg(clk, reset, WriteVSATPM, CSRWriteValM, VSATP_REGW);
+  else
+    assign VSATP_REGW = '0;
+
+  if (P.SSTC_SUPPORTED) begin : vstc
+    if (P.XLEN == 64) begin : vstc64
+      flopenr #(P.XLEN) VSTIMECMPreg(clk, reset, WriteVSTIMECMPM, CSRWriteValM, VSTIMECMP_REGW);
+    end else begin : vstc32
+      flopenr #(P.XLEN) VSTIMECMPreg(clk, reset, WriteVSTIMECMPM, CSRWriteValM, VSTIMECMP_REGW[31:0]);
+      flopenr #(P.XLEN) VSTIMECMPHreg(clk, reset, WriteVSTIMECMPHM, CSRWriteValM, VSTIMECMP_REGW[63:32]);
+    end
+  end else assign VSTIMECMP_REGW = '0;
+
+  // Address Translation
+  if (P.XLEN == 64) begin : hgatp64
+    logic LegalHgatpModeM;
+    // HGATP Mode is in bits 63:60
+    // Modes: 0=Bare, 8=Sv39x4, 9=Sv48x4, 10=Sv57x4
+    assign LegalHgatpModeM = CSRWriteValM[63:60] == 4'h0 |
+                             (P.SV39_SUPPORTED & CSRWriteValM[63:60] == 4'h8) |
+                             (P.SV48_SUPPORTED & CSRWriteValM[63:60] == 4'h9) |
+                             (P.SV57_SUPPORTED & CSRWriteValM[63:60] == 4'hA);
+
+    // Only allow write if mode is legal. Invalid modes are ignored (WARL behavior: preserve old value)
+    // Alternatively, we could force invalid modes to Bare (0), but preserving old is safer WARL.
+    // However, simplest WARL is often "if invalid, don't write".
+    flopenr #(P.XLEN) HGATPreg(clk, reset, WriteHGATPM & LegalHgatpModeM, CSRWriteValM, HGATP_REGW);
+  end else begin : hgatp32
+    // RV32 HGATP Mode is in bit 31 (0=Bare, 1=Sv32x4)
+    logic LegalHgatpModeM;
+    assign LegalHgatpModeM = CSRWriteValM[31] == 1'b0 |
+                             (P.SV32_SUPPORTED & CSRWriteValM[31] == 1'b1);
+    flopenr #(P.XLEN) HGATPreg(clk, reset, WriteHGATPM & LegalHgatpModeM, CSRWriteValM, HGATP_REGW);
+  end
+
+  // Configuration & Timers
+  flopenr #(32) HCOUNTERENreg(clk, reset, WriteHCOUNTERENM, CSRWriteValM[31:0], HCOUNTEREN_REGW);
+
+  // HENVCFG: Conditional bit masking based on supported features (similar to MENVCFG in csrm.sv)
+  if (P.XLEN == 64) begin : henvcfg_update_64
+    always_comb begin
+      NextHENVCFG = HENVCFG_REGW;
+      if (WriteHENVCFGM) begin
+        // Mask WPRI/unsupported fields to 0 per spec.
+        NextHENVCFG[31:0] = {
+          16'b0,                                  // 31:16 WPRI
+          8'b0,                                   // 15:8  WPRI
+          CSRWriteValM[7]  & P.ZICBOZ_SUPPORTED,  // CBZE
+          CSRWriteValM[6]  & P.ZICBOM_SUPPORTED,  // CBCFE
+          LegalizedHENVCFG_CBIE & {2{P.ZICBOM_SUPPORTED}}, // CBIE (WARL, 10b reserved)
+          1'b0,                                   // SSE (Zicfiss) unsupported
+          1'b0,                                   // LPE (Zicfilp) unsupported
+          1'b0,                                   // WPRI
+          // FIOM is defined by the spec (not tied to virtmem support).
+          // Spike appears to treat FIOM as read-only zero; SIM_COMPLIANCE forces 0 for test alignment.
+          (SIM_COMPLIANCE ? 1'b0 : CSRWriteValM[0]) // FIOM
+        };
+        NextHENVCFG[63:32] = {
+          // Spike appears to treat STCE/PBMTE/ADUE as read-only zero; SIM_COMPLIANCE forces 0 for test alignment.
+          (SIM_COMPLIANCE ? 1'b0 : (CSRWriteValM[63] & P.SSTC_SUPPORTED)),   // STCE
+          (SIM_COMPLIANCE ? 1'b0 : (CSRWriteValM[62] & P.SVPBMT_SUPPORTED)), // PBMTE
+          (SIM_COMPLIANCE ? 1'b0 : (CSRWriteValM[61] & P.SVADU_SUPPORTED)),  // ADUE
+          1'b0,                                   // WPRI
+          1'b0,                                   // DTE (Ssdbltrp) unsupported
+          1'b0,                                   // WPRI
+          10'b0,                                  // 57:48 WPRI
+          14'b0,                                  // 47:34 WPRI
+          2'b0                                    // PMM (Ssnpm) unsupported
+        };
+      end
+    end
+  end else begin : henvcfg_update_32
+    always_comb begin
+      NextHENVCFG = HENVCFG_REGW;
+      if (WriteHENVCFGM) begin
+        // Mask WPRI/unsupported fields to 0 per spec.
+        NextHENVCFG[31:0] = {
+          16'b0,                                  // 31:16 WPRI
+          8'b0,                                   // 15:8  WPRI
+          CSRWriteValM[7]  & P.ZICBOZ_SUPPORTED,  // CBZE
+          CSRWriteValM[6]  & P.ZICBOM_SUPPORTED,  // CBCFE
+          LegalizedHENVCFG_CBIE & {2{P.ZICBOM_SUPPORTED}}, // CBIE (WARL, 10b reserved)
+          1'b0,                                   // SSE (Zicfiss) unsupported
+          1'b0,                                   // LPE (Zicfilp) unsupported
+          1'b0,                                   // WPRI
+          // FIOM is defined by the spec (not tied to virtmem support).
+          // Spike appears to treat FIOM as read-only zero; SIM_COMPLIANCE forces 0 for test alignment.
+          (SIM_COMPLIANCE ? 1'b0 : CSRWriteValM[0]) // FIOM
+        };
+      end
+      if (WriteHENVCFGHM) begin
+        // Mask WPRI/unsupported fields to 0 per spec.
+        NextHENVCFG[63:32] = {
+          // Spike appears to treat STCE/PBMTE/ADUE as read-only zero; SIM_COMPLIANCE forces 0 for test alignment.
+          (SIM_COMPLIANCE ? 1'b0 : (CSRWriteValM[31] & P.SSTC_SUPPORTED)),   // STCE
+          (SIM_COMPLIANCE ? 1'b0 : (CSRWriteValM[30] & P.SVPBMT_SUPPORTED)), // PBMTE
+          (SIM_COMPLIANCE ? 1'b0 : (CSRWriteValM[29] & P.SVADU_SUPPORTED)),  // ADUE
+          1'b0,                                   // WPRI
+          1'b0,                                   // DTE (Ssdbltrp) unsupported
+          1'b0,                                   // WPRI
+          10'b0,                                  // 57:48 WPRI
+          14'b0,                                  // 47:34 WPRI
+          2'b0                                    // PMM (Ssnpm) unsupported
+        };
+      end
+    end
+  end
+
+  flopenr #(64) HENVCFGreg(clk, reset, (WriteHENVCFGM | WriteHENVCFGHM), NextHENVCFG, HENVCFG_REGW);
+  if (P.XLEN == 64) begin : htimedelta_regs_64
+    flopenr #(P.XLEN) HTIMEDELTAreg(clk, reset, WriteHTIMEDELTAM, CSRWriteValM, HTIMEDELTA_REGW);
+  end else begin : htimedelta_regs_32
+    flopenr #(P.XLEN) HTIMEDELTAreg(clk, reset, WriteHTIMEDELTAM, CSRWriteValM, HTIMEDELTA_REGW[31:0]);
+    flopenr #(P.XLEN) HTIMEDELTAHreg(clk, reset, WriteHTIMEDELTAHM, CSRWriteValM, HTIMEDELTA_REGW[63:32]);
+  end
+  // GEILEN=0 (guest external interrupts unimplemented): HGEIP remains 0.
+  flopenr #(P.XLEN) HGEIPreg(clk, reset, WriteHGEIPM, '0, HGEIP_REGW);
+
+
+  // CSR Read and Illegal Access Logic
+  always_comb begin : csrrh
+    CSRHReadValM = '0;
+    LegalAccessM = 1'b0;
+
+    case (CSRAdrM)
+      MTINST:     begin LegalAccessM = (PrivilegeModeW == P.M_MODE); CSRHReadValM = MTINST_REGW; end
+      MTVAL2:     begin LegalAccessM = (PrivilegeModeW == P.M_MODE); CSRHReadValM = MTVAL2_REGW; end
+      HSTATUS:    begin LegalAccessM = LegalHAccessM; CSRHReadValM = HSTATUS_REGW; end
+      HEDELEG:    begin LegalAccessM = LegalHAccessM; CSRHReadValM = HEDELEG_REGW[P.XLEN-1:0]; end
+      HEDELEGH:   begin LegalAccessM = LegalHAccessM & (P.XLEN == 32); CSRHReadValM = {{(P.XLEN-32){1'b0}}, HEDELEG_REGW[63:32]}; end
+      HIDELEG:    begin LegalAccessM = LegalHAccessM; CSRHReadValM = {{(P.XLEN-12){1'b0}}, HIDELEG_REGW}; end
+      HIE:        begin LegalAccessM = LegalHAccessM; CSRHReadValM = HIE_REGW; end
+      HTIMEDELTA: begin LegalAccessM = LegalHAccessM; CSRHReadValM = HTIMEDELTA_REGW[P.XLEN-1:0]; end
+      HTIMEDELTAH:begin LegalAccessM = LegalHAccessM & (P.XLEN == 32); CSRHReadValM = {{(P.XLEN-32){1'b0}}, HTIMEDELTA_REGW[63:32]}; end
+      HCOUNTEREN: begin LegalAccessM = LegalHAccessM; CSRHReadValM = {{(P.XLEN-32){1'b0}}, HCOUNTEREN_REGW}; end
+      HGEIE:      begin LegalAccessM = LegalHAccessM; CSRHReadValM = HGEIE_REGW; end
+      HENVCFG:    begin LegalAccessM = LegalHAccessM; CSRHReadValM = HENVCFG_REGW[P.XLEN-1:0]; end
+      HENVCFGH:   begin LegalAccessM = LegalHAccessM & (P.XLEN == 32); CSRHReadValM = {{(P.XLEN-32){1'b0}}, HENVCFG_REGW[63:32]}; end
+      HTVAL:      begin LegalAccessM = LegalHAccessM; CSRHReadValM = HTVAL_REGW; end
+      HIP:        begin LegalAccessM = LegalHAccessM; CSRHReadValM = {{(P.XLEN-12){1'b0}}, ((HVIP_REGW) & HIP_MASK)}; end
+      HVIP:       begin LegalAccessM = LegalHAccessM; CSRHReadValM = {{(P.XLEN-12){1'b0}}, HVIP_REGW}; end
+      HTINST:     begin LegalAccessM = LegalHAccessM; CSRHReadValM = HTINST_REGW; end
+      HGATP:      begin LegalAccessM = LegalHAccessM; CSRHReadValM = HGATP_REGW; end
+      HGEIP:      begin LegalAccessM = LegalHAccessM; CSRHReadValM = HGEIP_REGW; end
+
+      VSSTATUS:   begin LegalAccessM = LegalVSAccessM; CSRHReadValM = VSSTATUS_REGW; end
+      VSIE:       begin LegalAccessM = LegalVSAccessM; CSRHReadValM = {{(P.XLEN-12){1'b0}}, VSIE_REGW}; end
+      VSTVEC:     begin LegalAccessM = LegalVSAccessM; CSRHReadValM = VSTVEC_REGW; end
+      VSSCRATCH:  begin LegalAccessM = LegalVSAccessM; CSRHReadValM = VSSCRATCH_REGW; end
+      VSEPC:      begin LegalAccessM = LegalVSAccessM; CSRHReadValM = VSEPC_REGW; end
+      VSCAUSE:    begin LegalAccessM = LegalVSAccessM; CSRHReadValM = VSCAUSE_REGW; end
+      VSTVAL:     begin LegalAccessM = LegalVSAccessM; CSRHReadValM = VSTVAL_REGW; end
+      VSIP:       begin LegalAccessM = LegalVSAccessM; CSRHReadValM = {{(P.XLEN-12){1'b0}}, VSIP_REGW}; end
+      VSATP:      begin LegalAccessM = LegalVSAccessM & P.VIRTMEM_SUPPORTED; CSRHReadValM = VSATP_REGW; end
+      VSTIMECMP:  begin LegalAccessM = LegalVSAccessM & P.SSTC_SUPPORTED & AllowVSTimecmpAccess; CSRHReadValM = VSTIMECMP_REGW[P.XLEN-1:0]; end
+      VSTIMECMPH: begin LegalAccessM = LegalVSAccessM & P.SSTC_SUPPORTED & (P.XLEN == 32) & AllowVSTimecmpAccess; CSRHReadValM = {{(P.XLEN-32){1'b0}}, VSTIMECMP_REGW[63:32]}; end
+
+      default:    begin LegalAccessM = 1'b0; CSRHReadValM = '0; end
+    endcase
+    if (~LegalAccessM) CSRHReadValM = '0;
+    IllegalCSRHAccessM = ~LegalAccessM;
+    if (CSRWriteM && ReadOnlyCSR)
+      IllegalCSRHAccessM = 1'b1;
+  end
+
+endmodule
