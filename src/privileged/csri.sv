@@ -62,7 +62,7 @@ module csri import cvw::*;  #(parameter cvw_t P) (
   // MEIP, MTIP, MSIP are read-only
   // SEIP, STIP, SSIP is writable in MIP if S mode exists
   // SSIP is writable in SIP if S mode exists
-  if (P.S_SUPPORTED) begin:mask
+  if (P.S_SUPPORTED) begin : mask
     if (P.SSTC_SUPPORTED) begin
       assign MIP_WRITE_MASK = ENVCFG_STCE ? 16'h0202 : 16'h0222; // SEIP and SSIP are writable, but STIP is not writable when STIMECMP is implemented (see SSTC spec)
       assign STIP = ENVCFG_STCE ? STimerInt : MIP_REGW_writeable[5];
